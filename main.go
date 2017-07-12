@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-redis/redis"
 	"github.com/google/jsonapi"
@@ -15,9 +17,12 @@ import (
 )
 
 type Config struct {
+	EventTTL      time.Duration
+
 	RedisAddr     string
-	RedisPassword string
 	RedisDB       int
+	RedisPassword string
+	RedisPrefix   string
 
 	RmqAddr string
 }
@@ -31,12 +36,27 @@ type Env struct {
 type Event struct {
 	ID      string `jsonapi:"primary,event"`
 	Topic   string `jsonapi:"attr,topic"`
-	Payload string `jsonapi:"attr,payload"`
-	Link    string `jsonapi:"attr,link"`
+	Payload string `jsonapi:"attr,payload,omitempty"`
+	Link    string `jsonapi:"attr,link,omitempty"`
+}
+
+type EventRIO struct {
+	ID string `jsonapi:"primary,event"`
 }
 
 func collectConfig() (config Config) {
 	var missingEnv []string
+
+	// EVENT_TTL
+	var envEventTTL string = os.Getenv("EVENT_TTL")
+
+	if envEventTTL == "" {
+		config.EventTTL = time.Hour
+	} else {
+		i, err := strconv.Atoi(envEventTTL)
+		panicOnError(err, "Error parsing EVENT_TTL")
+		config.EventTTL = time.Duration(i) * time.Second
+	}
 
 	// RMQ_ADDR
 	config.RmqAddr = os.Getenv("RMQ_ADDR")
@@ -62,6 +82,15 @@ func collectConfig() (config Config) {
 		i, err := strconv.Atoi(envRedisDB)
 		panicOnError(err, "Error parsing REDIS_DB")
 		config.RedisDB = i
+	}
+
+	// REDIS_PREFIX
+	var envRedisPrefix string = os.Getenv("REDIS_PREFIX")
+
+	if envRedisPrefix == "" {
+		config.RedisPrefix = "ph:"
+	} else {
+		config.RedisPrefix = envRedisPrefix
 	}
 
 	// Validation
@@ -135,6 +164,12 @@ func (env *Env) handleEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Check for topic
+		if event.Topic == "" {
+			makeErrorResponse(w, 422, "topic", 2201)
+			return
+		}
+
 		// Validate or Assign UUID if not present
 		if event.ID == "" {
 			u4, err := uuid.NewV4()
@@ -159,6 +194,12 @@ func (env *Env) handleEvent(w http.ResponseWriter, r *http.Request) {
 		if err := jsonapi.MarshalPayload(buf, event); err != nil {
 			makeErrorResponse(w, 500, err.Error(), 0)
 			return
+		}
+
+		// Cache event for Pollers
+		err := env.redis.Set(fmt.Sprintf("%sevent:%s", env.config.RedisPrefix, event.ID), buf.String(), env.config.EventTTL).Err()
+		if err != nil {
+			makeErrorResponse(w, 500, err.Error(), 0)
 		}
 
 		// Send event to event bus
@@ -201,8 +242,26 @@ func (env *Env) handleEvent(w http.ResponseWriter, r *http.Request) {
 
 		// Send response
 		if err := jsonapi.MarshalPayload(w, event); err != nil {
+			//makeErrorResponse(w, 500, err.Error(), 0)
+		}
+
+		return
+	} else if r.Method == "GET" {
+		redisKeys := env.redis.Keys(fmt.Sprintf("%sevent:*", env.config.RedisPrefix))
+
+		var keyObjects []*EventRIO
+		for _, key := range redisKeys.Val() {
+			var redisKey []string = strings.Split(key, ":")
+
+			keyObjects = append(keyObjects, &EventRIO{redisKey[len(redisKey)-1]})
+		}
+
+		if err := jsonapi.MarshalPayload(w, keyObjects); err != nil {
 			makeErrorResponse(w, 500, err.Error(), 0)
 		}
+	} else {
+		makeErrorResponse(w, 405, r.Method, 0)
+		return
 	}
 }
 
@@ -228,7 +287,7 @@ func main() {
 	log.Println("Connected to Redis")
 
 	// Build Environment
-	env := &Env{amqp: conn, redis: client}
+	env := &Env{amqp: conn, redis: client, config: &config}
 
 	http.HandleFunc("/event/v1", env.handleEvent)
 	http.ListenAndServe(":8080", nil)
