@@ -17,7 +17,7 @@ import (
 )
 
 type Config struct {
-	EventTTL      time.Duration
+	EventTTL time.Duration
 
 	RedisAddr     string
 	RedisDB       int
@@ -103,14 +103,120 @@ func collectConfig() (config Config) {
 	return
 }
 
-func panicOnError(err error, msg string) {
-	if err != nil {
-		log.Fatalf("%s: %s", msg, err)
-		panic(fmt.Sprintf("%s: %s", msg, err))
+func (env *Env) handleEvent(response http.ResponseWriter, request *http.Request) {
+	response.Header().Set("Content-Type", jsonapi.MediaType) // application/vnd.api+json
+
+	if request.Method == "POST" {
+		// Get event from eventString
+		event := new(Event)
+		if err := jsonapi.UnmarshalPayload(request.Body, event); err != nil {
+			makeErrorResponse(response, 400, err.Error(), 1)
+			return
+		}
+
+		// Check for topic
+		if event.Topic == "" {
+			makeErrorResponse(response, 422, "topic", 2201)
+			return
+		}
+
+		// Validate or Assign UUID if not present
+		if event.ID == "" {
+			u4, err := uuid.NewV4()
+			if err != nil {
+				makeErrorResponse(response, 500, err.Error(), 0)
+				return
+			}
+			event.ID = u4.String()
+		} else {
+			u, err := uuid.ParseHex(event.ID)
+			_ = u
+			if err != nil {
+				makeErrorResponse(response, 400, err.Error(), 0)
+				return
+			}
+		}
+
+		log.Printf("New event: %s", event.ID)
+
+		// Build Response
+		var eventPayload bytes.Buffer
+		if err := jsonapi.MarshalPayload(&eventPayload, event); err != nil {
+			makeErrorResponse(response, 500, err.Error(), 0)
+			return
+		}
+
+		// Cache event for Pollers
+		// TODO use Redis hash
+		err := env.redis.Set(fmt.Sprintf("%sevent:%s", env.config.RedisPrefix, event.ID), eventPayload.String(), env.config.EventTTL).Err()
+		if err != nil {
+			makeErrorResponse(response, 500, err.Error(), 0)
+			return
+		}
+
+		// Send event to event bus
+		ch, err := env.amqp.Channel()
+		if err != nil {
+			makeErrorResponse(response, 500, fmt.Sprintf("Failed to open a channel: %s", err), 0)
+			return
+		}
+		defer ch.Close()
+
+		err = ch.ExchangeDeclare(
+			"events", // name
+			"topic",  // type
+			true,     // durable
+			false,    // auto-deleted
+			false,    // internal
+			false,    // no-wait
+			nil,      // arguments
+		)
+		if err != nil {
+			makeErrorResponse(response, 500, err.Error(), 0)
+			return
+		}
+
+		err = ch.Publish(
+			"events",    // exchange
+			event.Topic, // routing key
+			false,       // mandatory
+			false,       // immediate
+			amqp.Publishing{
+				ContentType: "text/plain",
+				Body:        eventPayload.Bytes(),
+			})
+		if err != nil {
+			makeErrorResponse(response, 500, err.Error(), 0)
+			return
+		}
+
+		// Send response
+		fmt.Fprint(response, eventPayload.String())
+
+		return
+	} else if request.Method == "GET" {
+		eventKeys := env.redis.Keys(fmt.Sprintf("%sevent:*", env.config.RedisPrefix))
+
+		// Build list of resource identifiers
+		var recentEvents []*EventRIO
+		for _, key := range eventKeys.Val() {
+			var redisKey []string = strings.Split(key, ":")
+			recentEvents = append(recentEvents, &EventRIO{redisKey[len(redisKey)-1]})
+		}
+
+		if err := jsonapi.MarshalPayload(response, recentEvents); err != nil {
+			makeErrorResponse(response, 500, err.Error(), 0)
+			return
+		}
+
+		return
+	} else {
+		makeErrorResponse(response, 405, request.Method, 0)
+		return
 	}
 }
 
-func makeErrorResponse(w http.ResponseWriter, status int, detail string, code int) {
+func makeErrorResponse(response http.ResponseWriter, status int, detail string, code int) {
 	var codeTitle map[int]string
 	codeTitle = make(map[int]string)
 	codeTitle[1] = "Malformed JSON Body"
@@ -142,8 +248,8 @@ func makeErrorResponse(w http.ResponseWriter, status int, detail string, code in
 	}
 
 	// Send Response
-	w.WriteHeader(status)
-	jsonapi.MarshalErrors(w, []*jsonapi.ErrorObject{{
+	response.WriteHeader(status)
+	jsonapi.MarshalErrors(response, []*jsonapi.ErrorObject{{
 		Title:  title,
 		Detail: detail,
 		Status: statusStr,
@@ -153,115 +259,10 @@ func makeErrorResponse(w http.ResponseWriter, status int, detail string, code in
 	return
 }
 
-func (env *Env) handleEvent(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", jsonapi.MediaType) // application/vnd.api+json
-
-	if r.Method == "POST" {
-		// Get event from body
-		event := new(Event)
-		if err := jsonapi.UnmarshalPayload(r.Body, event); err != nil {
-			makeErrorResponse(w, 400, err.Error(), 1)
-			return
-		}
-
-		// Check for topic
-		if event.Topic == "" {
-			makeErrorResponse(w, 422, "topic", 2201)
-			return
-		}
-
-		// Validate or Assign UUID if not present
-		if event.ID == "" {
-			u4, err := uuid.NewV4()
-			if err != nil {
-				makeErrorResponse(w, 500, err.Error(), 0)
-				return
-			}
-			event.ID = u4.String()
-		} else {
-			u, err := uuid.ParseHex(event.ID)
-			_ = u
-			if err != nil {
-				makeErrorResponse(w, 400, err.Error(), 0)
-				return
-			}
-		}
-
-		log.Printf("New event: %v", event)
-
-		// Build Response
-		buf := bytes.NewBufferString("")
-		if err := jsonapi.MarshalPayload(buf, event); err != nil {
-			makeErrorResponse(w, 500, err.Error(), 0)
-			return
-		}
-
-		// Cache event for Pollers
-		err := env.redis.Set(fmt.Sprintf("%sevent:%s", env.config.RedisPrefix, event.ID), buf.String(), env.config.EventTTL).Err()
-		if err != nil {
-			makeErrorResponse(w, 500, err.Error(), 0)
-		}
-
-		// Send event to event bus
-		ch, err := env.amqp.Channel()
-		if err := jsonapi.MarshalPayload(buf, event); err != nil {
-			makeErrorResponse(w, 500, fmt.Sprintf("Failed to open a channel: %s", err), 0)
-			return
-		}
-		defer ch.Close()
-
-		err = ch.ExchangeDeclare(
-			"events", // name
-			"topic",  // type
-			true,     // durable
-			false,    // auto-deleted
-			false,    // internal
-			false,    // no-wait
-			nil,      // arguments
-		)
-		if err != nil {
-			makeErrorResponse(w, 500, err.Error(), 0)
-			return
-		}
-
-		body := buf.String()
-		err = ch.Publish(
-			"events",    // exchange
-			event.Topic, // routing key
-			false,       // mandatory
-			false,       // immediate
-			amqp.Publishing{
-				ContentType: "text/plain",
-				Body:        []byte(body),
-			})
-
-		if err != nil {
-			makeErrorResponse(w, 500, err.Error(), 0)
-			return
-		}
-
-		// Send response
-		if err := jsonapi.MarshalPayload(w, event); err != nil {
-			//makeErrorResponse(w, 500, err.Error(), 0)
-		}
-
-		return
-	} else if r.Method == "GET" {
-		redisKeys := env.redis.Keys(fmt.Sprintf("%sevent:*", env.config.RedisPrefix))
-
-		var keyObjects []*EventRIO
-		for _, key := range redisKeys.Val() {
-			var redisKey []string = strings.Split(key, ":")
-
-			keyObjects = append(keyObjects, &EventRIO{redisKey[len(redisKey)-1]})
-		}
-
-		if err := jsonapi.MarshalPayload(w, keyObjects); err != nil {
-			makeErrorResponse(w, 500, err.Error(), 0)
-		}
-	} else {
-		makeErrorResponse(w, 405, r.Method, 0)
-		return
+func panicOnError(err error, msg string) {
+	if err != nil {
+		log.Fatalf("%s: %s", msg, err)
+		panic(fmt.Sprintf("%s: %s", msg, err))
 	}
 }
 
