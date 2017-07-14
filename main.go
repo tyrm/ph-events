@@ -147,8 +147,7 @@ func (env *Env) handleEvent(response http.ResponseWriter, request *http.Request)
 		}
 
 		// Cache event for Pollers
-		// TODO use Redis hash
-		err := env.redis.Set(fmt.Sprintf("%sevent:%s", env.config.RedisPrefix, event.ID), eventPayload.String(), env.config.EventTTL).Err()
+		err := env.redis.Set(fmt.Sprintf("%sevent:%s:%s", env.config.RedisPrefix, event.Topic, event.ID), eventPayload.String(), env.config.EventTTL).Err()
 		if err != nil {
 			makeErrorResponse(response, 500, err.Error(), 0)
 			return
@@ -195,7 +194,13 @@ func (env *Env) handleEvent(response http.ResponseWriter, request *http.Request)
 
 		return
 	} else if request.Method == "GET" {
-		eventKeys := env.redis.Keys(fmt.Sprintf("%sevent:*", env.config.RedisPrefix))
+		var eventKeys *redis.StringSliceCmd
+
+		if val, ok := request.URL.Query()["filter[topic]"]; ok {
+			eventKeys = env.redis.Keys(fmt.Sprintf("%sevent:%s:*", env.config.RedisPrefix, val[0]))
+		} else {
+			eventKeys = env.redis.Keys(fmt.Sprintf("%sevent:*", env.config.RedisPrefix))
+		}
 
 		// Build list of resource identifiers
 		var recentEvents []*EventRIO
@@ -210,6 +215,40 @@ func (env *Env) handleEvent(response http.ResponseWriter, request *http.Request)
 		}
 
 		return
+	} else {
+		makeErrorResponse(response, 405, request.Method, 0)
+		return
+	}
+}
+
+func (env *Env) handleEventObject(response http.ResponseWriter, request *http.Request) {
+	response.Header().Set("Content-Type", jsonapi.MediaType) // application/vnd.api+json
+
+	if request.Method == "GET" {
+		path  := strings.Split(request.URL.Path, "/")
+		eventID := path[len(path)-1]
+
+		// Validate eventID is UUID
+		if _, err := uuid.ParseHex(eventID); err != nil {
+			makeErrorResponse(response, 400, err.Error(), 0)
+			return
+		}
+
+		eventKey := env.redis.Keys(fmt.Sprintf("%sevent:*:%s", env.config.RedisPrefix, eventID)).Val()
+		if len(eventKey) == 0{
+			makeErrorResponse(response, 404, eventID, 0)
+			return
+		}
+
+		eventString, err := env.redis.Get(eventKey[0]).Result()
+		if err != nil {
+			makeErrorResponse(response, 500, err.Error(), 0)
+			return
+		}
+
+		fmt.Fprint(response, eventString)
+		return
+
 	} else {
 		makeErrorResponse(response, 405, request.Method, 0)
 		return
@@ -283,7 +322,7 @@ func main() {
 	})
 
 	pong, err := client.Ping().Result()
-	_ = pong
+	log.Printf("redis ping: %s", pong)
 	panicOnError(err, "Failed to connect to Redis")
 	log.Println("Connected to Redis")
 
@@ -291,5 +330,6 @@ func main() {
 	env := &Env{amqp: conn, redis: client, config: &config}
 
 	http.HandleFunc("/event/v1", env.handleEvent)
+	http.HandleFunc("/event/v1/", env.handleEventObject)
 	http.ListenAndServe(":8080", nil)
 }
